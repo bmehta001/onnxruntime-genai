@@ -210,4 +210,6 @@ cache after shutdown and requires the second manager to create a fresh cache,
 proving that the first manager released its file and the replacement initialized.
 Telemetry lifecycle coverage is enabled with
 `-DENABLE_TELEMETRY_TEST_HOOKS=ON`; the hook is off by default and uses a dummy
-token with no collector URL.
+token with no collector URL. It bypasses only the CI and unit-test harness
+heuristics; `ORT_DISABLE_TELEMETRY` is a user-facing opt-out that the library
+honors unconditionally, so no build configuration can override it.

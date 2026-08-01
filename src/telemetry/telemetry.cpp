@@ -80,6 +80,10 @@ std::string GetToken() {
   return decoded;
 }
 
+// Test-only: lets the telemetry lifecycle run inside a test harness, which the CI and unit-test
+// heuristics would otherwise suppress. Compiled out unless ENABLE_TELEMETRY_TEST_HOOKS=ON, forces a
+// dummy token with no collector URL so nothing is transmitted, and never overrides the
+// ORT_DISABLE_TELEMETRY user opt-out.
 bool IsTelemetryTestMode() {
 #if defined(ORTGENAI_ENABLE_TELEMETRY_TEST_HOOKS)
   return TelemetryInternal::IsCiValueTruthy(
@@ -182,11 +186,14 @@ void GenAiTelemetry::Initialize() {
   const bool telemetry_test_mode = IsTelemetryTestMode();
   // Full suppression is process-wide and irreversible: never create the uploader, emit an event, or
   // persist a device id. Latching also covers later GenAI reinitialization after an environment change.
+  // ORT_DISABLE_TELEMETRY is a user-facing opt-out and is honored unconditionally, ahead of the test
+  // hook, so no build configuration can override it. The hook only bypasses the CI and unit-test
+  // harness heuristics, which are internal environment signals rather than expressions of consent.
   if (telemetry_disabled_.load() ||
+      TelemetryInternal::IsTelemetryDisabledByEnvironment() ||
       (!telemetry_test_mode &&
        (TelemetryInternal::IsRunningInCI() ||
-        TelemetryInternal::IsRunningUnitTests() ||
-        TelemetryInternal::IsTelemetryDisabledByEnvironment()))) {
+        TelemetryInternal::IsRunningUnitTests()))) {
     telemetry_disabled_.store(true);
     enabled_.store(false);
     return;

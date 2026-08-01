@@ -143,10 +143,19 @@ add_test(
     concurrent
     "${CMAKE_CURRENT_BINARY_DIR}/implicit_shutdown_state/$<CONFIG>/concurrent"
 )
+# Guards the user-facing opt-out: ORT_DISABLE_TELEMETRY must suppress telemetry even in a build
+# compiled with ENABLE_TELEMETRY_TEST_HOOKS=ON and running with the internal test-mode variable set.
+add_test(
+  NAME TelemetryOptOutShutdownTests
+  COMMAND implicit_shutdown_tests
+    optout
+    "${CMAKE_CURRENT_BINARY_DIR}/implicit_shutdown_state/$<CONFIG>/optout"
+)
 set_tests_properties(
   ImplicitShutdownTests
   ReinitImplicitShutdownTests
   ConcurrentImplicitShutdownTests
+  TelemetryOptOutShutdownTests
   PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 30

@@ -239,6 +239,6 @@ jobs:
       export DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:$(Build.SourcesDirectory)/build/cpu/osx-arm64
       ./build/cpu/osx-arm64/unit_tests
       ctest --test-dir build/cpu/osx-arm64 --build-config Release --output-on-failure \
-        -R '^(ImplicitShutdownTests|ReinitImplicitShutdownTests|ConcurrentImplicitShutdownTests)$'
+        -R '^(ImplicitShutdownTests|ReinitImplicitShutdownTests|ConcurrentImplicitShutdownTests|TelemetryOptOutShutdownTests)$'
     displayName: 'Run unit tests'
     workingDirectory: '$(Build.SourcesDirectory)'

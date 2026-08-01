@@ -28,6 +28,18 @@ void SetEnv(const char* name, const char* value) {
 #endif
 }
 
+void UnsetEnv(const char* name) {
+#ifdef _WIN32
+  if (_putenv_s(name, "") != 0) {
+    throw std::runtime_error(std::string{"Failed to clear "} + name);
+  }
+#else
+  if (unsetenv(name) != 0) {
+    throw std::runtime_error(std::string{"Failed to clear "} + name);
+  }
+#endif
+}
+
 void ConfigureIsolatedTelemetry(const std::filesystem::path& state_dir) {
   std::error_code ec;
   std::filesystem::remove_all(state_dir, ec);
@@ -37,9 +49,15 @@ void ConfigureIsolatedTelemetry(const std::filesystem::path& state_dir) {
     throw std::runtime_error("Failed to create telemetry test state directory: " + ec.message());
   }
 
-  // Keep ORT telemetry suppressed while the test-only GenAI hook runs 1DS with no collector URL.
+  // ORT_RUNNING_UNIT_TESTS keeps ONNX Runtime's own telemetry suppressed. The GenAI test hook
+  // bypasses only that harness signal, so the 1DS lifecycle under test still runs, using a dummy
+  // token with no collector URL.
   SetEnv("ORT_RUNNING_UNIT_TESTS", "1");
-  SetEnv("ORT_DISABLE_TELEMETRY", "1");
+  // ORT_DISABLE_TELEMETRY is a user opt-out that the library honors unconditionally, so an
+  // ambient setting would suppress the very lifecycle these tests cover. Clear it for this test
+  // process only: the cache below is redirected into a scratch directory that the test wipes, and
+  // the hook's empty collector URL means nothing leaves the machine.
+  UnsetEnv("ORT_DISABLE_TELEMETRY");
   SetEnv("ORTGENAI_INTERNAL_TELEMETRY_TEST_MODE", "1");
 #ifdef _WIN32
   SetEnv("LOCALAPPDATA", state_dir.string().c_str());
@@ -68,6 +86,12 @@ void RequireTelemetryCache(const std::filesystem::path& storage_dir) {
 #else
   (void)storage_dir;
 #endif
+}
+
+void RequireNoTelemetryCache(const std::filesystem::path& storage_dir) {
+  if (std::filesystem::exists(storage_dir / "onnxruntime-genai.db")) {
+    throw std::runtime_error("ORT_DISABLE_TELEMETRY was set but telemetry still created its cache");
+  }
 }
 
 void RunCpuWorkload() {
@@ -121,7 +145,7 @@ void RunConcurrentCpuWorkloads() {
 
 int main(int argc, char** argv) {
   if (argc != 3) {
-    std::cerr << "Usage: implicit_shutdown_tests <implicit|reinit|concurrent> <state_dir>" << std::endl;
+    std::cerr << "Usage: implicit_shutdown_tests <implicit|reinit|concurrent|optout> <state_dir>" << std::endl;
     return 2;
   }
 
@@ -130,6 +154,17 @@ int main(int argc, char** argv) {
     ConfigureIsolatedTelemetry(state_dir);
     const std::filesystem::path telemetry_storage_dir = TelemetryStorageDir(state_dir);
     const std::string mode = argv[1];
+
+    if (mode == "optout") {
+      // Regression guard for the user-facing opt-out. This binary already runs with the internal
+      // test-mode variable set, so it reproduces the one combination where a bypass could hide:
+      // a build compiled with ENABLE_TELEMETRY_TEST_HOOKS=ON, test mode active, and the user
+      // opting out. Telemetry must stay fully suppressed and leave no cache behind.
+      SetEnv("ORT_DISABLE_TELEMETRY", "1");
+      RunCpuWorkload();
+      RequireNoTelemetryCache(telemetry_storage_dir);
+      return 0;
+    }
 
     if (mode == "concurrent") {
       RunConcurrentCpuWorkloads();
