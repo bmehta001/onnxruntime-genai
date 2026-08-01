@@ -107,16 +107,22 @@ struct EnsureShutdown {
 };
 
 std::unique_ptr<OrtGlobals>& GetOrtGlobals() {
-  // Registered once; its destructor runs at process exit (before g_ort_globals is destroyed) and
-  // performs the final Shutdown().
-  static EnsureShutdown ensure_shutdown;
   // The OrtGlobals constructor does not re-enter GetOrtGlobals() (it bootstraps the CPU interface
   // via the OrtGlobals member accessor), so acquiring this lock here cannot deadlock. The lock is
   // released before the returned reference is dereferenced by callers, so it does not nest with
   // device_interfaces_mutex_.
   std::scoped_lock lock{g_ort_globals_mutex};
-  if (!g_ort_globals && !g_process_exiting)
+  if (!g_ort_globals && !g_process_exiting) {
     g_ort_globals = std::make_unique<OrtGlobals>();
+    // Register process-exit teardown only after ORT has initialized the globals used by
+    // ~OrtGlobals. Function-local statics are destroyed in reverse construction order, so this
+    // guard runs while those ORT globals are still alive. Registering it any earlier put
+    // ~OrtGlobals after them: releasing the OrtEnv from __cxa_finalize then drives ORT's
+    // Environment and LoggingManager destructors to lock a mutex whose backing static is already
+    // finalized, which throws "mutex lock failed: Invalid argument" out of a destructor and aborts
+    // the process via std::terminate.
+    static EnsureShutdown ensure_shutdown;
+  }
 
   return g_ort_globals;
 }
@@ -152,8 +158,8 @@ void Shutdown() {
 
   // Reset g_ort_globals directly (rather than through GetOrtGlobals(), which would lazily construct
   // the globals just to immediately tear them down). If genai was never initialized there is nothing
-  // to do. Delete now because on process exit is too late. ~OrtGlobals tears down the device
-  // interfaces (including the RyzenAI EP shutdown) and unloads the genai add-on libraries.
+  // to do. ~OrtGlobals tears down the device interfaces (including the RyzenAI EP shutdown), unloads
+  // the genai add-on libraries, and finally releases the OrtEnv.
   std::scoped_lock lock{g_ort_globals_mutex};
   g_ort_globals.reset();
 }

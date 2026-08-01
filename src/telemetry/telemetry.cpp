@@ -19,10 +19,13 @@
 #include "ortgenai_telemetry_tenant_token.h"
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <new>
 #include <random>
 #include <string>
+#include <thread>
 
 // Version string defined by the build system
 #ifndef ORTGENAI_VERSION
@@ -77,6 +80,15 @@ std::string GetToken() {
   return decoded;
 }
 
+bool IsTelemetryTestMode() {
+#if defined(ORTGENAI_ENABLE_TELEMETRY_TEST_HOOKS)
+  return TelemetryInternal::IsCiValueTruthy(
+      TelemetryInternal::GetTelemetryEnv("ORTGENAI_INTERNAL_TELEMETRY_TEST_MODE"));
+#else
+  return false;
+#endif
+}
+
 bool PrepareSampledEvent(MAT::EventProperties& event, std::string_view app_session_guid,
                          uint32_t session_id) {
   if (!TelemetryInternal::ShouldSampleSession(app_session_guid, session_id)) return false;
@@ -106,6 +118,18 @@ std::string GenerateGuidV4() {
   return std::string(buf);
 }
 
+struct EnsureTelemetryShutdown {
+  ~EnsureTelemetryShutdown() noexcept {
+    try {
+      if (!GenAiTelemetry::IsDestroyed()) {
+        GenAiTelemetry::Instance().ShutdownAtProcessExit();
+      }
+    } catch (...) {
+      // Telemetry teardown must not affect process exit.
+    }
+  }
+};
+
 #endif  // ORTGENAI_ENABLE_TELEMETRY
 
 }  // namespace
@@ -124,12 +148,23 @@ struct GenAiTelemetry::Impl {};
 
 #endif  // ORTGENAI_ENABLE_TELEMETRY
 
-// Guard against access after static destruction
+// Set only if the singleton is ever destroyed. Instance() deliberately never destroys it, so this
+// stays false; the checks at the call sites remain as a safety net.
 static std::atomic<bool> s_instance_destroyed{false};
 
 GenAiTelemetry& GenAiTelemetry::Instance() {
-  static GenAiTelemetry instance;
-  return instance;
+  // Intentionally immortal. 1DS creates its own function-local statics lazily inside
+  // CreateLogManager, so this coordinator is constructed before them and would be destroyed after
+  // them. Running ~Impl at that point would free the log manager configuration while the SDK still
+  // references it, and flushing there is the static-destruction deadlock this design exists to
+  // avoid. Teardown is driven by EnsureTelemetryShutdown instead, which is registered after the
+  // first event and therefore destroyed before the SDK statics. Keeping the object alive also lets
+  // ShutdownAtProcessExit abandon a wedged manager without invalidating threads still inside
+  // LogEvent. Placement new into static storage keeps this out of the heap so leak detectors do not
+  // report it.
+  alignas(GenAiTelemetry) static unsigned char storage[sizeof(GenAiTelemetry)];
+  static GenAiTelemetry* instance = new (storage) GenAiTelemetry();
+  return *instance;
 }
 
 bool GenAiTelemetry::IsDestroyed() {
@@ -140,13 +175,18 @@ void GenAiTelemetry::Initialize() {
 #if defined(ORTGENAI_ENABLE_TELEMETRY)
   std::unique_lock<std::shared_mutex> lock(mutex_);
   if (initialized_.load()) return;
+  // Process-exit teardown has begun. Building a manager now would leave one that no guard is left
+  // to tear down, and installing it over impl_ would destroy a still-referenced configuration.
+  if (exiting_.load()) return;
 
+  const bool telemetry_test_mode = IsTelemetryTestMode();
   // Full suppression is process-wide and irreversible: never create the uploader, emit an event, or
   // persist a device id. Latching also covers later GenAI reinitialization after an environment change.
   if (telemetry_disabled_.load() ||
-      TelemetryInternal::IsRunningInCI() ||
-      TelemetryInternal::IsRunningUnitTests() ||
-      TelemetryInternal::IsTelemetryDisabledByEnvironment()) {
+      (!telemetry_test_mode &&
+       (TelemetryInternal::IsRunningInCI() ||
+        TelemetryInternal::IsRunningUnitTests() ||
+        TelemetryInternal::IsTelemetryDisabledByEnvironment()))) {
     telemetry_disabled_.store(true);
     enabled_.store(false);
     return;
@@ -189,18 +229,26 @@ void GenAiTelemetry::Initialize() {
   try {
     // Ingestion token: an official build's override from the generated header
     // (ORTGENAI_TELEMETRY_TENANT_TOKEN) if present, otherwise the encoded in-repo default.
+    std::string ikey;
+    if (telemetry_test_mode) {
+      ikey = "0123456789abcdef0123456789abcdef-01234567-0123-0123-0123-0123456789ab-0123";
+    } else {
 #if defined(ORTGENAI_TELEMETRY_TENANT_TOKEN)
-    const std::string ikey = ORTGENAI_TELEMETRY_TENANT_TOKEN;
+      ikey = ORTGENAI_TELEMETRY_TENANT_TOKEN;
 #else
-    const std::string ikey = GetToken();
+      ikey = GetToken();
 #endif
+    }
     if (ikey.empty()) return;  // no token -> cannot send; stay uninitialized
 
     pending_impl = std::make_unique<Impl>();
 
     // Configuration is owned by the pending Impl so it outlives the log manager (the SDK holds a reference to it).
     auto& config = pending_impl->config;
-    config[MAT::CFG_STR_COLLECTOR_URL] = "https://mobile.events.data.microsoft.com/OneCollector/1.0";
+    // 1DS treats an empty URL as "do not schedule uploads", so test builds exercise the real
+    // lifecycle with a dummy token without permitting network transmission.
+    config[MAT::CFG_STR_COLLECTOR_URL] =
+        telemetry_test_mode ? "" : "https://mobile.events.data.microsoft.com/OneCollector/1.0";
     config[MAT::CFG_STR_PRIMARY_TOKEN] = ikey;
     config[MAT::CFG_INT_TRACE_LEVEL_MASK] = 0;
     config[MAT::CFG_INT_SDK_MODE] = MAT::SdkModeTypes::SdkModeTypes_CS;
@@ -274,39 +322,95 @@ void GenAiTelemetry::Initialize() {
 #endif
 }
 
+#if defined(ORTGENAI_ENABLE_TELEMETRY)
+void GenAiTelemetry::TeardownLocked() {
+  auto impl = std::move(impl_);
+  if (!impl) return;
+
+  // 1DS-recommended shutdown sequence. Each operation is independent and best effort so Release()
+  // still runs if flushing or teardown fails. Release must precede destroying Impl because the SDK
+  // holds a reference to its configuration.
+  if (impl->log_manager) {
+    try {
+      impl->log_manager->Flush();
+    } catch (...) {
+    }
+    try {
+      impl->log_manager->FlushAndTeardown();
+    } catch (...) {
+    }
+    try {
+      MAT::LogManagerProvider::Release(impl->config);
+    } catch (...) {
+    }
+    impl->log_manager = nullptr;
+    impl->logger = nullptr;
+  }
+}
+#endif
+
 void GenAiTelemetry::Shutdown() {
 #if defined(ORTGENAI_ENABLE_TELEMETRY)
+  // Safe to test before locking, because only process-exit teardown sets exiting_ -- never a
+  // concurrent Initialize() -- and by then the exit guard has already torn the manager down or
+  // deliberately abandoned it. Without this, an OgaHandle destroyed after the guard (the pattern
+  // ort_genai.h recommends) would block forever on the lock a wedged logging thread still holds.
+  if (exiting_.load()) return;
+
+  // Otherwise lock first, so an OgaShutdown() racing a model load serializes behind Initialize()
+  // and observes the manager it just created rather than reporting success while telemetry starts.
   std::unique_lock<std::shared_mutex> lock(mutex_);
   if (!initialized_.load()) return;
 
   // The exclusive lock waits for active LogEvent calls to release their shared locks and prevents
   // new ones from observing the logger while teardown is in progress.
   initialized_.store(false);
+  TeardownLocked();
+#endif
+}
 
-  // 1DS-recommended shutdown sequence. Each operation is independent and best effort so Release()
-  // still runs if flushing or teardown fails.
-  if (impl_ && impl_->log_manager) {
-    try {
-      impl_->log_manager->Flush();
-    } catch (...) {
+void GenAiTelemetry::ShutdownAtProcessExit() {
+#if defined(ORTGENAI_ENABLE_TELEMETRY)
+  // Latch first and unconditionally. LockForLogging stops handing out shared locks, so in-flight
+  // callers drain and new ones cannot starve the acquisition below; Initialize() also stops, so a
+  // model load racing this cannot install a manager that outlives every teardown path. initialized_
+  // is deliberately left alone until the lock is held, preserving the invariant that it is only
+  // cleared together with the teardown it describes.
+  exiting_.store(true);
+
+  // Registering this guard after the first event keeps 1DS's own statics alive through teardown, so
+  // logging threads drain normally and this lock is virtually always free. Bound the wait anyway: a
+  // thread wedged inside LogEvent still holds its shared lock, and blocking on it would reintroduce
+  // the process-exit hang this guard exists to prevent.
+  constexpr auto kDrainTimeout = std::chrono::seconds(2);
+  const auto deadline = std::chrono::steady_clock::now() + kDrainTimeout;
+  std::unique_lock<std::shared_mutex> lock(mutex_, std::defer_lock);
+  while (!lock.try_lock()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      // A logging thread is stuck. Flushing through it would hang in 1DS's own unbounded wait, and
+      // impl_ must not be cleared from outside the lock because in-flight Log* calls re-read it
+      // after passing LockForLogging. Leave the manager owned by the immortal singleton, which is
+      // never destroyed, so the stuck thread keeps operating on valid memory while the process
+      // exits. Abandoning it cannot hang later either: LogManagerFactory tracks managers as raw
+      // ILogManager* pointers in its Pool registry and its destructor is empty, so the SDK never
+      // runs ~LogManagerImpl at exit. The pending event batch is lost, which beats never exiting.
+      return;
     }
-    try {
-      impl_->log_manager->FlushAndTeardown();
-    } catch (...) {
-    }
-    try {
-      MAT::LogManagerProvider::Release(impl_->config);
-    } catch (...) {
-    }
-    impl_->log_manager = nullptr;
-    impl_->logger = nullptr;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  impl_.reset();
+
+  // Unconditional: a model load that had already passed the exiting_ check may have installed a
+  // fresh manager while this was waiting, and at process exit that one has to come down too.
+  initialized_.store(false);
+  TeardownLocked();
 #endif
 }
 GenAiTelemetry::~GenAiTelemetry() {
+  // Unreachable for the immortal singleton returned by Instance(). Defined because
+  // std::unique_ptr<Impl> needs a destructor in this translation unit, where Impl is complete. Uses
+  // the bounded variant so it can never block if it is somehow reached during static destruction.
   s_instance_destroyed.store(true);
-  Shutdown();
+  ShutdownAtProcessExit();
 }
 
 bool GenAiTelemetry::IsEnabled() const {
@@ -339,8 +443,12 @@ void GenAiTelemetry::TrySuppressNetworkContext() {
 }
 
 std::shared_lock<std::shared_mutex> GenAiTelemetry::LockForLogging(bool require_enabled) {
+  // Tested before locking as well as after, so callers arriving once process-exit teardown has
+  // latched add no mutex traffic at all to the exit guard's bounded acquisition.
+  if (exiting_.load()) return {};
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  if ((require_enabled && !enabled_.load()) || !initialized_.load() || !impl_ || !impl_->logger)
+  if ((require_enabled && !enabled_.load()) || exiting_.load() || !initialized_.load() || !impl_ ||
+      !impl_->logger)
     return {};  // empty (unlocked) -> caller bails
   return lock;  // locked; ownership moves to caller
 }
@@ -350,6 +458,7 @@ std::shared_lock<std::shared_mutex> GenAiTelemetry::LockForLogging(bool require_
 void GenAiTelemetry::LogProcessInfo() {
 #if defined(ORTGENAI_ENABLE_TELEMETRY)
   bool emitted = false;
+  bool shutdown_guard_needed = false;
   bool warn_device_id_fallback = false;
   // Runtime API suppression leaves the uploader live, so ProcessInfo still fires. Full process
   // suppression never initializes a logger and returns here.
@@ -360,6 +469,9 @@ void GenAiTelemetry::LogProcessInfo() {
       emitted = true;
       return;
     }
+    // Only the thread that owns the first event may register the exit guard. Other logging threads
+    // can enter under shared locks while this event is still initializing lazy 1DS state.
+    shutdown_guard_needed = true;
 
     const auto& device = GetDeviceInfo();
     warn_device_id_fallback = device.device_id_status == "Failed";
@@ -393,6 +505,11 @@ void GenAiTelemetry::LogProcessInfo() {
   }
   // Allow a retry if telemetry was not live (or threw before emitting).
   if (!emitted) process_info_logged_.store(false);
+  if (shutdown_guard_needed) {
+    // Register only after the first event has traversed 1DS, so the guard is destroyed before the
+    // SDK statics that FlushAndTeardown depends on.
+    static EnsureTelemetryShutdown ensure_shutdown;
+  }
 #endif
 }
 

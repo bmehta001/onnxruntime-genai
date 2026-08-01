@@ -61,12 +61,19 @@ class GenAiTelemetry {
  public:
   static GenAiTelemetry& Instance();
 
-  // Returns true once telemetry shutdown or static deinitialization has begun.
+  // Returns true once the telemetry singleton has been destroyed. Instance() is intentionally
+  // immortal, so in practice this is always false; the call sites keep the check as a safety net.
+  // Use IsEnabled() to test whether telemetry is live.
   static bool IsDestroyed();
 
   // Lifecycle
   void Initialize();
   void Shutdown();
+
+  // Teardown for the process-exit guard. Performs the same full teardown as Shutdown(), but waits
+  // only a bounded time for in-flight logging to drain: if a logging thread is wedged, the manager
+  // is abandoned so process exit can still complete instead of hanging.
+  void ShutdownAtProcessExit();
 
   // Control
   bool IsEnabled() const;
@@ -150,12 +157,21 @@ class GenAiTelemetry {
   struct Impl;
 #if defined(ORTGENAI_ENABLE_TELEMETRY)
   void TrySuppressNetworkContext();
+
+  // Runs the 1DS teardown sequence. The caller must hold mutex_ exclusively and must already have
+  // cleared initialized_.
+  void TeardownLocked();
 #endif
   std::unique_ptr<Impl> impl_;
   std::atomic<bool> enabled_{true};
   std::atomic<bool> telemetry_disabled_{false};
   std::atomic<bool> network_context_suppressed_{false};
   std::atomic<bool> initialized_{false};
+  // Latched by process-exit teardown. Stops new logging so the exit guard's bounded wait cannot be
+  // starved, blocks Initialize() from building a manager nothing would tear down, and lets
+  // Shutdown() bail out before it would block on a lock a wedged logging thread still holds. Only
+  // process-exit teardown sets it, so it is safe to read without the lock.
+  std::atomic<bool> exiting_{false};
   std::atomic<bool> process_info_logged_{false};
 #if defined(__ANDROID__)
   std::atomic<bool> android_readiness_warning_logged_{false};

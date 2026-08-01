@@ -90,8 +90,8 @@ typedef struct OgaStreamingProcessor OgaStreamingProcessor;
 /**
  * \brief Shuts down the GenAI library and releases all GenAI-owned ONNX Runtime globals.
  *
- * \warning Callers SHOULD invoke OgaShutdown() before process exit. If it is not called, GenAI's globals are destroyed
- *          at static-destruction time in undefined order, which may crash.
+ * \note Callers SHOULD invoke OgaShutdown() for deterministic teardown. If it is omitted, GenAI's process-exit guards
+ *       shut telemetry and ONNX Runtime down while their dependent globals are still alive.
  *
  * \note C++ callers should prefer the OgaHandle RAII wrapper in ort_genai.h; C# callers should prefer the
  *       OgaHandle IDisposable wrapper. Both invoke OgaShutdown() on destruction.
@@ -103,7 +103,7 @@ typedef struct OgaStreamingProcessor OgaStreamingProcessor;
  *
  * \note Re-initialization: OgaShutdown() is a full teardown -- it destroys GenAI's ONNX Runtime environment and unloads
  *       GenAI's add-on libraries. GenAI may be used again after OgaShutdown(); the next GenAI call re-initializes with a
- *       fresh environment.
+ *       fresh environment and, when enabled, a fresh telemetry manager.
  *
  * \note If a host registered execution provider libraries directly on its own OrtEnv reference, it should unregister
  *       them (on that reference) and release the reference after OgaShutdown(), once all GenAI usage is finished.

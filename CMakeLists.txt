@@ -172,6 +172,11 @@ if(ENABLE_TELEMETRY)
   else()
     set(ORTGENAI_TELEMETRY_TENANT_TOKEN_DEFINE "")
   endif()
+  if(ENABLE_TELEMETRY_TEST_HOOKS)
+    set(ORTGENAI_TELEMETRY_TEST_HOOK_DEFINE "#define ORTGENAI_ENABLE_TELEMETRY_TEST_HOOKS 1")
+  else()
+    set(ORTGENAI_TELEMETRY_TEST_HOOK_DEFINE "")
+  endif()
   set(_ortgenai_telemetry_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/ortgenai_telemetry")
   configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ortgenai_telemetry_tenant_token.h.in"

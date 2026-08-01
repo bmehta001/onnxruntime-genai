@@ -30,4 +30,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "AIX" OR MAC_CATALYST)
 else()
   option(ENABLE_TELEMETRY "Enable telemetry data collection via 1DS SDK" ON)
 endif()
+cmake_dependent_option(
+  ENABLE_TELEMETRY_TEST_HOOKS
+  "Enable internal no-network telemetry lifecycle test hooks"
+  OFF
+  "ENABLE_TESTS;ENABLE_TELEMETRY"
+  OFF)
 set(ORTGENAI_TELEMETRY_TENANT_TOKEN "" CACHE STRING "Override the compiled-in 1DS telemetry ingestion token")

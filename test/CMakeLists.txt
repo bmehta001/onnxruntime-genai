@@ -15,6 +15,8 @@ file(GLOB test_srcs CONFIGURE_DEPENDS
 # reinit_tests.cpp is a standalone executable (it calls OgaShutdown() to exercise re-initialization
 # and has its own main()), so keep it out of the unit_tests sources.
 list(REMOVE_ITEM test_srcs "${CMAKE_CURRENT_SOURCE_DIR}/reinit_tests.cpp")
+# implicit_shutdown_tests.cpp is a standalone process-exit probe with its own main().
+list(REMOVE_ITEM test_srcs "${CMAKE_CURRENT_SOURCE_DIR}/implicit_shutdown_tests.cpp")
 
 if(USE_CUDA AND CMAKE_CUDA_COMPILER AND ENABLE_CUDA_KERNEL_TESTS)
   message(STATUS "Including CUDA kernel tests in the build.")
@@ -103,6 +105,53 @@ if (NOT MSVC)
 endif()
 
 add_test(NAME ReInitTests COMMAND reinit_tests)
+
+add_executable(implicit_shutdown_tests "${CMAKE_CURRENT_SOURCE_DIR}/implicit_shutdown_tests.cpp")
+target_include_directories(implicit_shutdown_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(ENABLE_TELEMETRY_TEST_HOOKS)
+  set(_ortgenai_test_expect_telemetry 1)
+else()
+  set(_ortgenai_test_expect_telemetry 0)
+endif()
+target_compile_definitions(implicit_shutdown_tests PRIVATE
+  ORTGENAI_TEST_EXPECT_TELEMETRY=${_ortgenai_test_expect_telemetry})
+target_link_libraries(implicit_shutdown_tests PRIVATE onnxruntime-genai)
+add_dependencies(implicit_shutdown_tests onnxruntime-genai)
+set_target_properties(implicit_shutdown_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:onnxruntime-genai>"
+    FOLDER "Tests"
+)
+if(NOT MSVC)
+  target_compile_options(implicit_shutdown_tests PRIVATE "-fvisibility=hidden")
+endif()
+
+add_test(
+  NAME ImplicitShutdownTests
+  COMMAND implicit_shutdown_tests
+    implicit
+    "${CMAKE_CURRENT_BINARY_DIR}/implicit_shutdown_state/$<CONFIG>/implicit"
+)
+add_test(
+  NAME ReinitImplicitShutdownTests
+  COMMAND implicit_shutdown_tests
+    reinit
+    "${CMAKE_CURRENT_BINARY_DIR}/implicit_shutdown_state/$<CONFIG>/reinit"
+)
+add_test(
+  NAME ConcurrentImplicitShutdownTests
+  COMMAND implicit_shutdown_tests
+    concurrent
+    "${CMAKE_CURRENT_BINARY_DIR}/implicit_shutdown_state/$<CONFIG>/concurrent"
+)
+set_tests_properties(
+  ImplicitShutdownTests
+  ReinitImplicitShutdownTests
+  ConcurrentImplicitShutdownTests
+  PROPERTIES
+    RUN_SERIAL TRUE
+    TIMEOUT 30
+)
+unset(_ortgenai_test_expect_telemetry)
 
 if (ENABLE_TELEMETRY AND NOT WIN32 AND NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
   add_executable(telemetry_device_info_tests

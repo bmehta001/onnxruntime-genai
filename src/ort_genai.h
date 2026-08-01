@@ -876,14 +876,11 @@ struct OgaEngine : OgaAbstract {
 /**
  * \brief RAII wrapper that calls OgaShutdown() on destruction.
  *
- * \warning Without explicit shutdown, GenAI's globals are destroyed at static-destruction time in undefined order,
- *          which may crash.
- *
- * \note Typical usage is to construct an instance early in the program so its destructor runs before process exit.
+ * \note Typical usage is to construct an instance early in the program so its destructor performs deterministic
+ *       teardown before other host globals. GenAI also registers a process-exit fallback for callers that omit one.
  *
  * \note Only one OgaHandle should be live in the process, and its scope must encompass all GenAI use. GenAI's globals
- *       are not re-creatable after OgaShutdown(); a second OgaHandle whose lifetime starts after the first one's
- *       destruction would leave subsequent GenAI calls broken.
+ *       are re-created on demand after OgaShutdown(), so a later non-overlapping OgaHandle is supported.
  */
 struct OgaHandle {
   OgaHandle() = default;

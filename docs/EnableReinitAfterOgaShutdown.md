@@ -46,9 +46,10 @@ on demand:
 - Creation is guarded by a mutex rather than `std::call_once` (which is
   process-once and would prevent re-init), so concurrent first-use -- or
   first-use after a shutdown -- cannot double-construct the globals.
-- A process-exit guard, `g_process_exiting`, is set by the `EnsureShutdown`
-  static destructor so `GetOrtGlobals()` cannot resurrect the globals during
-  static destruction.
+- A process-exit guard is constructed only after the first `OrtGlobals` has
+  finished construction. Its destructor therefore runs before the ORT statics
+  used by `~OrtGlobals`, sets `g_process_exiting`, and prevents
+  `GetOrtGlobals()` from resurrecting state during static destruction.
 - `Shutdown()` (behind `OgaShutdown`) simply resets `g_ort_globals`;
   `~OrtGlobals` performs all of the teardown.
 
@@ -56,6 +57,35 @@ The `OrtGlobals` constructor bootstraps the CPU interface through a member call
 (`this->GetDeviceInterface(DeviceType::CPU)`) rather than the free
 `GetDeviceInterface()` -> `GetOrtGlobals()` path, so it does not re-enter
 `GetOrtGlobals()` while still being constructed.
+
+## Telemetry re-initialization
+
+`OgaShutdown()` releases the active 1DS log manager before tearing down
+`OrtGlobals`. The process-wide `GenAiTelemetry` coordinator remains available
+with `initialized_` cleared, so the next model load creates a fresh log manager
+and offline cache connection. Process identity and the one-shot `ProcessInfo`
+event remain process-scoped rather than being emitted again for every
+re-initialization cycle.
+
+Telemetry also installs its process-exit guard only after the first event has
+traversed 1DS. This makes implicit teardown run before the SDK statics used by
+`FlushAndTeardown`, avoiding static-destruction deadlocks.
+
+The exit guard calls `ShutdownAtProcessExit()` rather than `Shutdown()`. It runs
+the same full teardown, but waits only a bounded time to acquire the telemetry
+lock. Correct guard ordering means in-flight logging drains normally and the
+lock is effectively always free; if a logging thread is ever wedged, the manager
+is abandoned so the process still exits instead of hanging. Explicit
+`OgaShutdown()` keeps the unbounded wait, because there the caller is still
+running and a complete flush is the expected behaviour -- unless process-exit
+teardown has already begun, in which case it returns immediately rather than
+blocking on a lock the exit guard may never be able to take.
+
+Because the guard is registered late it is destroyed early, so telemetry is no
+longer live for objects destroyed later in static destruction. A host that keeps
+an `OgaGenerator` in a global will not see its final generation event. Hosts that
+need those events should destroy their GenAI objects, or call `OgaShutdown()`,
+before returning from `main`.
 
 ## Device interface ownership
 
@@ -170,3 +200,14 @@ across repeated shutdown -> re-init cycles (no model load required). The
 object-library split -- the shipped shared library and the white-box tests both
 consume `onnxruntime-genai-obj` -- lets the tests reach internal symbols without
 exporting them from the shipped DLL.
+
+`implicit_shutdown_tests` exercises the shipped shared library in isolated
+processes. One case returns after a real model workload without calling
+`OgaShutdown`; the other performs model load -> `OgaShutdown` -> model reload
+and then returns implicitly. A third starts model workloads concurrently to
+cover first-use guard registration. The re-init case renames the first telemetry
+cache after shutdown and requires the second manager to create a fresh cache,
+proving that the first manager released its file and the replacement initialized.
+Telemetry lifecycle coverage is enabled with
+`-DENABLE_TELEMETRY_TEST_HOOKS=ON`; the hook is off by default and uses a dummy
+token with no collector URL.

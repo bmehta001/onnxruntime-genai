@@ -144,6 +144,7 @@ jobs:
       export RUSTFLAGS='-C link-arg=-Wl,-undefined,dynamic_lookup -C link-arg=-Wl,-no_dead_strip_inits_and_terms'
       export CCACHE_DIR=$(Build.SourcesDirectory)/.ccache
       cmake --preset macos_arm64_cpu_release -DENABLE_JAVA=ON -DUSE_GUIDANCE=ON \
+        -DENABLE_TELEMETRY_TEST_HOOKS=ON \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     displayName: 'Configure CMake'
@@ -237,5 +238,7 @@ jobs:
       export ORTGENAI_LOG_ORT_LIB=1
       export DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:$(Build.SourcesDirectory)/build/cpu/osx-arm64
       ./build/cpu/osx-arm64/unit_tests
+      ctest --test-dir build/cpu/osx-arm64 --build-config Release --output-on-failure \
+        -R '^(ImplicitShutdownTests|ReinitImplicitShutdownTests|ConcurrentImplicitShutdownTests)$'
     displayName: 'Run unit tests'
     workingDirectory: '$(Build.SourcesDirectory)'
